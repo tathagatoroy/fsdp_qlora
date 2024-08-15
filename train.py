@@ -1,3 +1,5 @@
+# modified to do controllable summarization using MACSUM using 
+# can cascaded lora be applied with this script 
 """
 Read our announcement blog post: https://www.answer.ai/posts/2024-03-06-fsdp-qlora.html.
 
@@ -26,7 +28,7 @@ import types
 from contextlib import nullcontext
 from glob import glob
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import bitsandbytes as bnb
 import safetensors
@@ -42,7 +44,7 @@ from bitsandbytes.nn import Linear4bit, Params4bit
 from fastcore.parallel import parallel
 
 # Argument parsing
-from fastcore.script import Param, bool_arg, call_parse
+from fastcore.script import Param, bool_arg, call_parse # type: ignore
 from packaging.version import parse
 from safetensors.torch import save_file
 
@@ -110,7 +112,8 @@ from lora import LORA
 
 from profiling_utils import profiling_context
 
-
+#logs dict to either tqdm, wandb and stdout
+#TODO make it support both wandb/tqdm and stdout -> Done
 class Logger:
     def __init__(self, args, log_to="stdout", project_name="fsdp_qlora", entity=None, group=None, name=None, rank=0):
         # self.log_every_n_steps = log_every_n_steps TODO: add this back as an option
@@ -126,9 +129,9 @@ class Logger:
                 tqdm.write(f'{k}: {v}')
         elif self.log_to == "wandb":
             wandb.log(d)
-        elif self.log_to == "stdout":
-            for k,v in d.items():
-                print(f'{k}: {v}')
+        #elif self.log_to == "stdout":
+        for k,v in d.items():
+            print(f'{k}: {v}')
 
     def finish(self, rank=0):
         if self.log_to == "wandb" and rank==0: wandb.finish()
@@ -142,15 +145,18 @@ def update_progress_bar(progress_bar:tqdm, epoch:int, log_loss:float, log_lr:flo
         else:
             progress_bar.set_description(f"Epoch {epoch}, Loss {log_loss:.3f}", refresh=True)
 
+#this function distributes cpu workers based on number of gpus/cpus and number of parameters
+#TODO -> number of parameter is hard set to 70B -> should make it a variable that can be passed.
+#TODO -> what is 40?
 def n_loading_workers(quant_method:str, param_count:float):
     devprops = torch.cuda.get_device_properties(torch.cuda.current_device())
     left = int(os.cpu_count()/torch.cuda.device_count())
-    right = int((4 if quant_method == "hqq" else 8) * (devprops.total_memory/1e9/40) * (70/(param_count/1e9)))
+    right = int((4 if quant_method == "hqq" else 8) * (devprops.total_memory/1e9/40) * (70/(param_count/1e9))) #70 is parameter in Billions
     return min(left, right)
 
 
 # Utilities related to model loading
-def replace_linear(model:nn.Module, linear_replacement:nn.Module, quant_config:dict|None=None,
+def replace_linear(model:nn.Module, linear_replacement:nn.Module, quant_config:Optional[dict] = None,
                    skip_modules:List[str]=["lm_head"], **kwargs):
     """
     Replace linear modules with a new Linear module.
@@ -166,7 +172,8 @@ def replace_linear(model:nn.Module, linear_replacement:nn.Module, quant_config:d
     for name, module in model.named_children():
         if name in skip_modules:
             continue
-
+        
+        #recursively do the replacements
         if len(list(module.children())) > 0:
             replace_linear(module, linear_replacement, quant_config, skip_modules, **kwargs)
 
@@ -178,6 +185,7 @@ def replace_linear(model:nn.Module, linear_replacement:nn.Module, quant_config:d
                     module.bias is not None,
                     **kwargs
                 )
+            #not important for now
             elif issubclass(linear_replacement, HQQLinear):
                 model._modules[name] = linear_replacement(module, quant_config, **kwargs)
             else:
@@ -187,13 +195,17 @@ def replace_linear(model:nn.Module, linear_replacement:nn.Module, quant_config:d
 
 def setup_quantized_meta_for_peft(model:nn.Module):
     """Replaces `quant_state.to` with a dummy function to prevent PEFT from moving `quant_state` to meta device"""
+    #this is a dummy function that does nothing
     def temp_to_method(self, *args, **kwargs):
         return self
     for param in model.parameters():
         if isinstance(param, Params4bit):
+            #if the original to method is not saved, save it
             param.quant_state._orig_to = param.quant_state.to
+            #replace the to method with the dummy function
             param.quant_state.to = types.MethodType(temp_to_method, param.quant_state)
 
+#undo the previous dummying 
 def setup_quantized_peft_meta_for_training(model:nn.Module):
     """Replaces dummy `quant_state.to` method with the original function to allow training to continue"""
     for param in model.parameters():
@@ -559,6 +571,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
 
     # Set up dataloader
     dataloader = get_dataloader(tokenizer, args)
+    import code; code.interact(local=locals())
 
 
     # Create model
