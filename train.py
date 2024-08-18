@@ -56,7 +56,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
     offload_wrapper,
 )
-
+import code 
 # FSDP
 from torch.distributed.fsdp import FullStateDictConfig, MixedPrecision, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -380,13 +380,16 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
     elif args["dataset"] == "sql":
         dataset = load_dataset("knowrohit07/know_sql")['validation']
         dataset = dataset.shuffle(seed=args["seed"])
-        dataset = dataset.select(range(1000,len(dataset)))
+        #dataset = dataset.select(range(1000,len(dataset)))
+        #dataset = dataset.select(range(10))
+        
     elif args["dataset"] == "orca_math":
         dataset = load_dataset("microsoft/orca-math-word-problems-200k")['train'].shuffle(seed=42)
         # train with 10k for starters. Then 100k.
         dataset = dataset.select(range(0,args['dataset_samples']))
 
     # truncate dataset so it's evenly divisible by grad_accumulation_steps
+    dataset = dataset.select(range(16))
     dataset = dataset.select(range(0, len(dataset)-len(dataset)%(args["batch_size"]*args["gradient_accumulation_steps"])))
 
     # # Create the InstructionDataset
@@ -421,7 +424,7 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
     # Use the custom collate function in DataLoader
     dataloader = DataLoader(dataset, batch_size=args["batch_size"], collate_fn=collate_fn, sampler=sampler)
 
-    return dataloader
+    return dataloader, dataset
 
 
 # LR scheduler.
@@ -478,6 +481,7 @@ def get_optimizer(model:nn.Module, args:Dict):
 # Wrap the model using LoRA policy from llama-recipes or custom policy:
 # This checks for lora layers (has weight and requires_grad)
 def get_wrapping_policy(custom_policy:bool=False, vanilla_policy:bool=False):
+    #why is line needed ?
     from peft.tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
 
     if custom_policy:
@@ -570,14 +574,57 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
     # Set up dataloader
-    dataloader = get_dataloader(tokenizer, args)
-    import code; code.interact(local=locals())
+    dataloader, dataset = get_dataloader(tokenizer, args)
+    #check if device is zero 
+    # if rank == 0 :
+    #     print("size of the dataset", len(dataset))
+    #     for key , value in dataset[0].items():
+    #         print(key, value)
+    #     print("-----------------------")
+    #     item = next(iter(dataloader))
+    #     print(item.keys())
+    #     input_ids = item['input_ids']
+    #     labels = item['labels']
+    #     #check if the input_ids and labels are of the same length
+    #     print(f"labels shape : {labels.shape}  input ids shape : {input_ids.shape}")
+    #     #check if the input_ids and labels are the same
+    #     print(f"torch allclose result {torch.allclose(input_ids, labels, atol=1e-5)}")
+    #     #decode the first example in input_ids skipping special tokens
+    #     print("decoded input without special tokens")
+    #     print(tokenizer.decode(input_ids[0], skip_special_tokens=True))
+    #     print("\n now without special tokens")
+    #     #decode the first example in input_ids not skipping special tokens
+    #     print("decoded input with special tokens")
+    #     print(tokenizer.decode(input_ids[0], skip_special_tokens=False))
+    #     print("-------------------\n--------------------------------")
+
+    #     #decode the labels with or without special tokens
+    #     #print("decoded labels with special tokens")
+    #     #print(tokenizer.decode(labels[0], skip_special_tokens=True))
+    #     #print("\n now without special tokens")
+    #     #print("decoded labels without special tokens")
+    #     #print(tokenizer.decode(labels[0], skip_special_tokens=False))
+    #     #print all special tokens dict , id and token
+    #     print(labels[0])
+    #     print(input_ids[0])
+    #     for key, value in tokenizer.special_tokens_map.items():
+    #         print(f"{key} : {value}")
+    #     #print the token id of the special tokens
+    #     print(f"eos : {tokenizer.eos_token_id}")
+    #     print(f"pad : {tokenizer.pad_token_id}")
+    #     print(f"unk : {tokenizer.unk_token_id}")
+    #     print(f"bos : {tokenizer.bos_token_id}")
+    
+    # #destroy the process group
+    # dist.destroy_process_group()
+    # exit()
+
 
 
     # Create model
     cfg = None
     attn_impl = "sdpa" # torch 2.2 sdpa uses flash attn 2
-    if rank == 0 or args['verbose']:
+    if rank == 0 and args['verbose']:
         print("Creating model", rank)
     if args["train_type"] in ["full", "lora", "custom_lora"]:
         if (args["low_memory"] and rank == 0) or (not args["low_memory"]):
@@ -652,8 +699,10 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             load_and_quantize(model, name, param, **kwargs)
 
         quant_method = "hqq" if args["train_type"] in ["hqq_lora", "hqq_dora", "hqq_llama_pro"] else "bnb"
+        if rank == 0 and args['verbose']:
+            print(f"quant_method: {quant_method}")
         param_count = sum((p.numel() for n,p in model.named_parameters()))
-        if rank == 0 or args['verbose']:
+        if rank == 0 and args['verbose']:
             print("Loading model", rank)
         if rank == 0 and args['verbose']:
             print(f"Total model params: {param_count}")
@@ -661,6 +710,9 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         n_workers = n_loading_workers(quant_method, param_count) if args["loading_workers"]==-1 else args["loading_workers"]
         if rank == 0 and args['verbose']:
             print(f"Using n_workers: {n_workers} for loading")
+
+        
+ 
 
         start = time.time()
         for filename in tqdm(files, desc="Loading & Quantizing Model Shards", disable=rank!=0, position=0):
@@ -719,6 +771,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 qlora_layer = lora_cls(m, args["lora_rank"], args["lora_alpha"], args["lora_dropout"])
                 parent_module = model.get_submodule(module_key)
                 setattr(parent_module, value_key, qlora_layer)
+        #question : what is lora_AB used for ?
         for n,p in model.named_parameters():
             if any([lora_name in n for lora_name in ['lora_AB', 'lora_A', 'lora_B', 'magnitude']]):
                 p.requires_grad = True
@@ -726,7 +779,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     print("Trainable LORA layer", n)
             else:
                 p.requires_grad = False
-        if rank == 0 or args['verbose']:
+        if rank == 0 and args['verbose']:
             print(f"Rank {rank}: LoRA layers added: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
 
     elif args["train_type"] in ["bnb_llama_pro", "hqq_llama_pro"]:
@@ -741,13 +794,17 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
     if args["log_to"] == 'wandb':
         logger.log({"memory/allocated_after_model_created": torch.cuda.memory_allocated(local_rank)}, rank)
         logger.log({"memory/reserved_after_model_creation": torch.cuda.memory_reserved(local_rank)}, rank)
+    if args['verbose']:
+        print(f"Rank {rank}: memory reserved after creation: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
+        print(f"Rank {rank}: memory allocated after creation: {torch.cuda.memory_allocated(local_rank)/2**30:.3f} GiB")
+    
 
 
     # Wrap model with llama-recipies or custom LoRA policy
     my_auto_wrap_policy = get_wrapping_policy(custom_policy=args["train_type"] in ["custom_qlora", "hqq_lora", "hqq_dora", "bnb_dora"],
                                                 vanilla_policy=args["train_type"] in ["full", "bnb_llama_pro", "hqq_llama_pro"])
 
-    if rank == 0 or args['verbose']:
+    if rank == 0 and args['verbose']:
         print("Wrapping model w/ FSDP", rank)
 
     if args["sharding_strategy"] == "full_shard":
@@ -777,7 +834,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             if (rank!=0 and args["low_memory"]) else None, # TODO note about meta device and why we need this
         mixed_precision=mp_policy,
     )
-    if rank == 0 or args['verbose']:
+    if rank == 0 and args['verbose']:
         print(f"Rank {rank}: Wrapped model: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
     if args["log_to"] == 'wandb':
         logger.log({"memory/allocated_after_model_wrap": torch.cuda.memory_allocated(local_rank)}, rank)
@@ -798,14 +855,16 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         )
 
         check_fn = lambda submodule: isinstance(submodule, (LlamaDecoderLayer, MistralDecoderLayer))
-        if rank == 0 or args['verbose']:
+        if rank == 0 and args['verbose']:
             print("Applying activation checkpointing", rank)
         apply_activation_checkpointing(
             model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
         )
+        if args['verbose'] and rank == 0:
+            print("Checkpointing applied", rank)
 
     if args["use_activation_cpu_offload"]:
-        if rank == 0 or args['verbose']:
+        if rank == 0 and args['verbose']:
             print("Applying activation offloading", rank)
         model = offload_wrapper(model)
 
@@ -878,6 +937,9 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     if args["log_to"] == 'wandb':
                         logger.log({"memory/allocated_before_forward": torch.cuda.memory_allocated(local_rank)}, rank)
                         logger.log({"memory/reserved_before_forward": reserved_before_forward}, rank)
+                    if args['verbose']:
+                        print(f"Rank {rank}: memory reserved Before forward: {reserved_before_forward/2**30:.2f} GiB")
+                        print(f"Rank {rank}: Before allocated forward: {torch.cuda.memory_allocated(local_rank)/2**30:.2f} GiB")
 
                 # Forward pass
                 with sync_context:
@@ -899,6 +961,9 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         if args["log_to"] == 'wandb':
                             logger.log({"memory/allocated_after_forward": torch.cuda.memory_allocated(local_rank)}, rank)
                             logger.log({"memory/reserved_after_forward": reserved_after_forward}, rank)
+                        if args['verbose']:
+                            print(f"Rank {rank}: memory reserved After forward: {reserved_after_forward/2**30:.2f} GiB")
+                            print(f"Rank {rank}: After allocated forward: {torch.cuda.memory_allocated(local_rank)/2**30:.2f} GiB")
 
                     # Backward pass
                     if scale_grads:
@@ -933,6 +998,9 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                     if args["log_to"] == 'wandb':
                         logger.log({"memory/allocated_after_backward": torch.cuda.memory_allocated(local_rank)}, rank)
                         logger.log({"memory/reserved_after_backward": reserved_after_backward}, rank)
+                    if args['verbose']:
+                        print(f"Rank {rank}: memory reserved After backward: {reserved_after_backward/2**30:.2f} GiB")
+                        print(f"Rank {rank}: After allocated backward: {torch.cuda.memory_allocated(local_rank)/2**30:.2f} GiB")
 
                 # Delete the output so more memory frees up before the next forward pass
                 output = None
@@ -1164,7 +1232,11 @@ def fsdp_qlora(
     args = dict(locals())
     set_seed(args['seed'])
     validate_args(args)
-    if args['verbose']: print(args)
+    if args['verbose']: 
+        #print(args)\
+        for key in args:
+            print(f"{key}: {args[key]}")
+
 
     # If lora_target_modules is 'all', set sensible defaults for llama + mistral type modules
     # See peft.utils.constants -> TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING for the current defaults

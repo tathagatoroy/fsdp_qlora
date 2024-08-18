@@ -1,3 +1,12 @@
+from torch.nn.utils.rnn import pad_sequence
+from torch.optim.lr_scheduler import LambdaLR
+from torch.profiler import ProfilerActivity, profile, record_function
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from tqdm.auto import tqdm
+import json
+import torch
+import copy
+
 # DATASET + DATALOADERS (modified from llama recipes)
 # Formatting prompts in alpaca
 PROMPT_DICT = {
@@ -14,37 +23,56 @@ PROMPT_DICT = {
 }
 
 # Dataset class
-class InstructionDataset(Dataset):
-    def __init__(self, dataset, tokenizer, style="alpaca"):
-        self.dataset = dataset
+class MACSUM(Dataset):
+    def __init__(self, dataset_path, tokenizer, attribute = 'length'):
+        self.dataset_path = dataset_path
+        self.dataset = json.load(open(dataset_path,"r"))
         self.tokenizer = tokenizer
-        self.style = style
+        self.attribute = attribute
+        self.filter_by_attribute()
+
+
+
+    def alpaca_promp_format(self, src_text, instruction):
+        return f"Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{src_text}\n\n### Response:"
+    def generate_attribute_specific_instruction(self,control_value):
+        base_prompt = f"Write a summary of the source text."
+        if self.attribute == 'length':
+            ca_aspect = f"The summary should be {control_value} in length. The length is defined in terms of number of words used in the summary"
+        elif controllable_aspect == 'extractiveness':
+            ca_aspect = f"The summary should be {control_description} in extractiveness. Extractiveness is defined by the degree of exact copying from the source text"
+        elif controllable_aspect == 'specificity':
+            ca_aspect = f"The summary should be {control_description} in specificity. Specificity is defined by the degree of detail in the summary"
+        elif controllable_aspect == 'topic':
+            ca_aspect = f"The summary should be focussed on the topic {control_description}"
+        elif controllable_aspect == 'Speaker':
+            ca_aspect = f"The summary should be written from the perspective of {control_description}"
+        #prompt = f"{base_prompt} {ca_aspect}. The source text is given below. "
+        instruction = f"{base_prompt} {ca_aspect}. The source text is given below. "
+        return instruction
+
+
+    
+    def filter_by_attribute(self):
+        tmp_dataset = {}
+        for key , value in self.dataset.items():
+            if value['control_attribute'][self.attribute] != '':
+                tmp_dataset[key] = value
+        self.dataset = tmp_dataset
+        self.index_to_keys = list(self.dataset.keys())
+
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         IGNORE_INDEX = -100  # The default setting in CrossEntropyLoss
-        if self.style == "guanaco":
-            prompt = self.dataset[index]["text"].split("### Assistant: ")[0]
-            example = self.dataset[index]["text"]
-        elif self.style == "qna":
-            prompt_template = "###Context:\n{context}\n###Question:\n{question}\n###Answer:\n"
-            sample = self.dataset[index]
-            prompt = prompt_template.format_map(sample)
-            example = prompt + sample['answer']
-        elif self.style == "qna_no_ctx":
-            prompt_template = "###Question:\n{question}\n###Answer:\n"
-            sample = self.dataset[index]
-            prompt = prompt_template.format_map(sample)
-            example = prompt + sample['answer']
-        else: # Alpaca
-            ann = self.dataset[index]
-            if ann.get("input", "") == "":
-                prompt = PROMPT_DICT["prompt_no_input"].format_map(ann)
-            else:
-                prompt = PROMPT_DICT["prompt_input"].format_map(ann)
-            example = prompt + ann["output"]
+        src = self.dataset[self.index_to_keys[index]]['source']
+        reference = self.dataset[self.index_to_keys[index]]['reference']
+        attribute_value = self.dataset[self.index_to_keys[index]]['control_attribute'][self.attribute]
+        instruction = self.generate_attribute_specific_instruction(attribute_value)
+        prompt = self.alpaca_promp_format(src, instruction)
+        example = prompt + reference
 
         prompt = torch.tensor(
             self.tokenizer.encode(prompt), dtype=torch.int64
@@ -67,67 +95,34 @@ class InstructionDataset(Dataset):
             "attention_mask":example_mask.tolist(),
         }
 
-# And to get the dataloader
-def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
-    """Creates a dataset and appropriate dataloader with distributed sampler."""
-    # Importing here rather than at the start to avoid multiprocessing issues
-    from datasets import Dataset, load_dataset
+# if __name__=='__main__':
+#     model_name = "meta-llama/Meta-Llama-3.1-8B"
+#     #import huggingface tokenizers from transformers
+#     from transformers import AutoTokenizer
+#     tokenizer = AutoTokenizer.from_pretrained(model_name)
+#     dataset_path = "/home2/tathagato/summarization/MACSUM/dataset/macdoc/train_dataset.json"
+#     dataset = MACSUM(dataset_path, tokenizer, attribute = 'length')
+#     print(len(dataset))
+#     example = dataset[0]
+#     print(example.keys())
+#     #import code; code.interact(local=locals())
+#     input_ids = example['input_ids']
+#     print("text with special tokens")
+#     print(tokenizer.decode(input_ids))
+#     print("text without special tokens")
+#     print(tokenizer.decode(input_ids, skip_special_tokens=True))
 
-    # Load the source dataset
-    if args["dataset"] == "alpaca":
-        dataset = load_dataset("yahma/alpaca-cleaned")['train']
-    elif args["dataset"] == "alpaca_sample":
-        dataset = load_dataset("yahma/alpaca-cleaned", split=f"train[:{args['dataset_samples']}]")
-    elif args["dataset"] == "dummy":
-        dataset = Dataset.from_dict({
-            'instruction': ["instruction"]*args["dataset_samples"],
-            'input': ["input"]*args["dataset_samples"],
-            'output': ["output"*args["context_length"]*2]*args["dataset_samples"]} # A long output to test memory usage (gets truncated)
-        )
-    elif args["dataset"] == "guanaco":
-        dataset = load_dataset("timdettmers/openassistant-guanaco", split="train")
-    elif args["dataset"] == "sql":
-        dataset = load_dataset("knowrohit07/know_sql")['validation']
-        dataset = dataset.shuffle(seed=args["seed"])
-        dataset = dataset.select(range(1000,len(dataset)))
-    elif args["dataset"] == "orca_math":
-        dataset = load_dataset("microsoft/orca-math-word-problems-200k")['train'].shuffle(seed=42)
-        # train with 10k for starters. Then 100k.
-        dataset = dataset.select(range(0,args['dataset_samples']))
+#     labels = example['labels']
+#     print(labels)
+#     print(input_ids)
 
-    # truncate dataset so it's evenly divisible by grad_accumulation_steps
-    dataset = dataset.select(range(0, len(dataset)-len(dataset)%(args["batch_size"]*args["gradient_accumulation_steps"])))
-
-    # # Create the InstructionDataset
-    if args["dataset"] == "guanaco":
-        dataset = InstructionDataset(dataset, tokenizer, style="guanaco")
-    elif args["dataset"] == "sql":
-        dataset = InstructionDataset(dataset, tokenizer, style="qna")
-    elif args["dataset"] == "orca_math":
-        dataset = InstructionDataset(dataset, tokenizer, style="qna_no_ctx")
-    else: # (w/ alpaca prompt formatting)
-        dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
-
-    # Collate function
-    def collate_fn(batch, with_attention_mask=False):
-        # To list of tensors
-        input_ids = [torch.tensor(item['input_ids']) for item in batch]
-        attention_masks = [torch.tensor(item['attention_mask']) for item in batch]
-        labels = [torch.tensor(item['labels']) for item in batch]
-        # Pad + truncate
-        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)[:, :args["context_length"]]
-        if with_attention_mask:
-            attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)[:, :args["context_length"]]
-        else:
-            attention_masks = None
-        labels = pad_sequence(labels, batch_first=True, padding_value=-100)[:, :args["context_length"]]
-        # Return dict
-        return {'input_ids': input_ids, 'attention_mask': attention_masks, 'labels': labels}
-
-    # For distributed training, use DistributedSampler
-    sampler = DistributedSampler(dataset, seed=args["seed"])
-
-    # Use the custom collate function in DataLoader
-    dataloader = DataLoader(dataset, batch_size=args["batch_size"], collate_fn=collate_fn, sampler=sampler)
-
-    return dataloader
+#     #get the sequence after the last -100 in labels
+#     new_labels = []
+#     for i in labels:
+#         if i != -100:
+#             new_labels.append(i)
+#     print(new_labels)
+#     print("text with special tokens")
+#     print(tokenizer.decode(new_labels))
+#     print("text without special tokens")
+#     print(tokenizer.decode(new_labels, skip_special_tokens=True))
